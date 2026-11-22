@@ -11,12 +11,13 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 ADMINS = {"U0C7S6T72DD"}  # Slack member IDs allowed to use admin commands
 
 # Replies in this list are only visible to the person who used the command.
-# In private replies people show as REAL mentions (clickable profile, but no ping).
-# In public replies people show as bold names (no ping).
 # Solo games (blackjack, roulette, rps vs the bot) are private too.
 PRIVATE = {"balance", "deposit", "withdraw", "inventory", "catalog", "buy", "use",
            "ecohelp", "stats", "collect", "work", "crime", "leaderboard",
-           "blackjack", "roulette", "rob", "give"}
+           "blackjack", "roulette", "audit"}
+# Commands that involve another person: public, and both people get a REAL @ping.
+# (Errors like "wait 30s" still stay private to the person who ran the command.)
+MENTION = {"rob", "give"}
 
 # ---------- database ----------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")
@@ -24,7 +25,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")
 # ---------- free cloud backup of the coins (private GitHub repo) ----------
 # Set GITHUB_TOKEN (fine-grained token, "Contents: read & write" on ONE private repo)
 # and GITHUB_REPO ("yourname/hakari-data"). The database is restored on start and
-# saved every couple of minutes, so coins survive restarts on hosts with a wiped disk.
+# saved every 10 seconds when something changed, so coins survive restarts on hosts with a wiped disk.
 import base64, json, signal, urllib.request, urllib.error
 
 GH_TOKEN, GH_REPO = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPO")
@@ -99,7 +100,7 @@ def backup_db(force=False):
 
 def backup_loop():
     while True:
-        time.sleep(120)
+        time.sleep(10)
         backup_db()
 
 
@@ -110,6 +111,7 @@ db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash INTEGER
 db.execute("CREATE TABLE IF NOT EXISTS cooldowns (uid TEXT, action TEXT, ts REAL, PRIMARY KEY (uid, action))")
 db.execute("CREATE TABLE IF NOT EXISTS items (name TEXT PRIMARY KEY, price INTEGER, description TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS inv (uid TEXT, name TEXT, amount INTEGER, PRIMARY KEY (uid, name))")
+db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash INTEGER, bank INTEGER, why TEXT)")
 try:
     db.execute("ALTER TABLE users ADD COLUMN name TEXT")
 except sqlite3.OperationalError:
@@ -117,12 +119,12 @@ except sqlite3.OperationalError:
 db.commit()
 
 COIN = "🪙"
-COOLDOWNS = {"work": 60, "crime": 90, "rob": 180, "collect": 86400}  # seconds
+COOLDOWNS = {"work": 60, "crime": 60, "rob": 120, "collect": 86400}  # seconds (admins have none)
 GAME_TIMEOUT = 300  # seconds before an unfinished game is cancelled and refunded
 
 # chatting earns coins: every CHAT_COOLDOWN seconds a message pays CHAT_MIN..CHAT_MAX
 CHAT_COOLDOWN = 30
-CHAT_MIN, CHAT_MAX = 5, 20
+CHAT_MIN, CHAT_MAX = 10, 30
 chat_last = {}
 
 
@@ -139,8 +141,12 @@ def get(uid):
 
 def change(uid, cash=0, bank=0):
     get(uid)
+    why = sys._getframe(1).f_code.co_name  # which function moved the money (see /audit)
     with lock:
         db.execute("UPDATE users SET cash=cash+?, bank=bank+? WHERE uid=?", (int(cash), int(bank), uid))
+        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, int(cash), int(bank), why))
+        if random.random() < 0.01:
+            db.execute("DELETE FROM log WHERE ts < ?", (time.time() - 7 * 86400,))
         db.commit()
 
 
@@ -180,14 +186,6 @@ def name_of(uid):
     return r[0] if r and r[0] else "someone"
 
 
-def notify(uid, text):
-    """DM a person so they get a real notification (names inside are shown as display names)."""
-    try:
-        app.client.chat_postMessage(channel=uid, text=render(text, False))
-    except Exception as e:
-        print("Could not DM", uid, repr(e))
-
-
 MARK = re.compile(r"⟦(\w+)⟧")
 
 
@@ -213,6 +211,8 @@ def section(text):
 
 def cooldown_left(uid, action):
     """Returns seconds left. If 0, the cooldown is (re)started now."""
+    if uid in ADMINS:
+        return 0
     now = time.time()
     with lock:
         row = db.execute("SELECT ts FROM cooldowns WHERE uid=? AND action=?", (uid, action)).fetchone()
@@ -274,7 +274,8 @@ def cmd(name, keep_case=False):
             # lowercase everything except @mentions (user IDs are case-sensitive)
             args = tokens if keep_case else [t if t.startswith("<") else t.lower() for t in tokens]
             try:
-                out = fn(command["user_id"], args)
+                with lock:  # one command at a time: no double-spending with fast clicks
+                    out = fn(command["user_id"], args)
             except Exception as e:
                 print("Error:", repr(e))
                 respond("Something broke 😅 check the terminal.", response_type="ephemeral")
@@ -284,7 +285,8 @@ def cmd(name, keep_case=False):
                 respond(**render(out, False))
             else:
                 private = name in PRIVATE or out.startswith(("❌", "⏱", "🔒"))
-                respond(render(out, False), response_type="ephemeral" if private else "in_channel")
+                ping = name in MENTION and not private
+                respond(render(out, ping), response_type="ephemeral" if private else "in_channel")
         return fn
     return deco
 
@@ -330,7 +332,6 @@ def give(uid, args):
         return f"❌ Invalid. You have {fmt(cash)} cash."
     change(uid, cash=-amt)
     change(target, cash=amt)
-    notify(target, f"💸 {tag(uid)} gave you {fmt(amt)}.")
     return f"✅ {tag(uid)} gave {fmt(amt)} to {tag(target)}."
 
 
@@ -358,7 +359,7 @@ def work(uid, args):
     left = cooldown_left(uid, "work")
     if left:
         return wait_text(left)
-    pay = random.randint(50, 200)
+    pay = random.randint(100, 350)
     job = random.choice(["delivered pizzas 🍕", "fixed some bugs 🐛", "walked dogs 🐕",
                          "mowed lawns 🌱", "freelanced 👨‍💻"])
     change(uid, cash=pay)
@@ -367,12 +368,12 @@ def work(uid, args):
 
 @cmd("crime")
 def crime(uid, args):
-    """55% to win 150-700. If you fail you only lose 5-10% of your cash (never more than you hold)."""
+    """60% to win 200-900. If you fail you only lose 5-10% of your cash (never more than you hold)."""
     left = cooldown_left(uid, "crime")
     if left:
         return wait_text(left)
-    if random.random() < 0.55:
-        win = random.randint(150, 700)
+    if random.random() < 0.60:
+        win = random.randint(200, 900)
         change(uid, cash=win)
         return f"🕵️ You pulled off a heist and got {fmt(win)}."
     cash, _ = get(uid)
@@ -383,31 +384,30 @@ def crime(uid, args):
 
 @cmd("rob")
 def rob(uid, args):
-    """45% to steal 40-70% of the target's cash. If you fail you pay the target 20-35% of your cash
-    (minimum 50, capped at what you hold). The victim gets a DM either way."""
+    """50% to steal 40-90% of the target's cash. If you fail you pay the target 15-30% of your cash
+    (minimum 50, capped at what you hold). Public message, both people get pinged."""
     if not args or not parse_user(args[0]):
         return "❌ Usage: `/rob @user`"
     target = parse_user(args[0])
     if target == uid:
         return "❌ You can't rob yourself."
     t_cash, _ = get(target)
-    if t_cash <= 0:
-        return f"❌ {tag(target)} has no cash on hand to rob."
+    if t_cash < 50:
+        return f"❌ {tag(target)} only has {fmt(t_cash)} cash on hand, not worth it (needs 50+)."
     left = cooldown_left(uid, "rob")
     if left:
         return wait_text(left)
     my_cash, _ = get(uid)
-    if random.random() < 0.45:
-        win = max(1, int(t_cash * random.randint(40, 70) / 100))
+    if random.random() < 0.50:
+        pct = random.randint(40, 90)
+        win = max(1, int(t_cash * pct / 100))
         change(target, cash=-win)
         change(uid, cash=win)
-        notify(target, f"🚨 {tag(uid)} robbed you and took {fmt(win)}!")
-        return f"🕶️ {tag(uid)} robbed {tag(target)} and got away with {fmt(win)}."
-    loss = min(max(my_cash, 0), max(50, int(max(my_cash, 0) * random.randint(20, 35) / 100)))
+        return f"🕶️ {tag(uid)} robbed {tag(target)} and took {fmt(win)} ({pct}% of their cash)!"
+    loss = min(max(my_cash, 0), max(50, int(max(my_cash, 0) * random.randint(15, 30) / 100)))
     change(uid, cash=-loss)
     change(target, cash=loss)  # the victim gets the fine
-    notify(target, f"🛡️ {tag(uid)} tried to rob you but failed and paid you {fmt(loss)}!")
-    return f"🚔 {tag(uid)} got caught robbing {tag(target)} and paid them {fmt(loss)}."
+    return f"🚔 {tag(uid)} got caught robbing {tag(target)} and had to pay them {fmt(loss)}!"
 
 
 @cmd("collect")
@@ -415,8 +415,8 @@ def collect(uid, args):
     left = cooldown_left(uid, "collect")
     if left:
         return wait_text(left)
-    change(uid, bank=500)
-    return f"🎁 You collected your daily reward of {fmt(500)} (to bank)."
+    change(uid, bank=1000)
+    return f"🎁 You collected your daily reward of {fmt(1000)} (to bank)."
 
 
 # ---------- chatting earns coins ----------
@@ -462,8 +462,12 @@ def solo_timer(store, gid):
 games = {}
 
 
+SUITS = "♠♥♦♣"
+
+
 def card(c):
-    return {1: "A", 11: "J", 12: "Q", 13: "K"}.get(c, str(c))
+    rank, suit = c
+    return f"[{ {1: 'A', 11: 'J', 12: 'Q', 13: 'K'}.get(rank, str(rank)) }{suit}]"
 
 
 def show(h):
@@ -471,16 +475,18 @@ def show(h):
 
 
 def hand_val(h):
-    t = sum(min(c, 10) for c in h)
-    if 1 in h and t + 10 <= 21:
+    t = sum(min(c[0], 10) for c in h)
+    if any(c[0] == 1 for c in h) and t + 10 <= 21:
         t += 10
     return t
 
 
-def bj_view(g, result=None):
-    dealer = f"{show(g['d'])} (= {hand_val(g['d'])})" if result else f"{card(g['d'][0])} ?"
+def bj_view(g, result=None, drew=None):
+    dealer = f"{show(g['d'])} (= {hand_val(g['d'])})" if result else f"{card(g['d'][0])} [?]"
     text = (f"🃏 *Blackjack* | {tag(g['uid'])} bet {fmt(g['bet'])}\n"
-            f"Your hand: {show(g['p'])} (= {hand_val(g['p'])})\nDealer: {dealer}")
+            f"Your cards: {show(g['p'])}  =  *{hand_val(g['p'])}*\nDealer: {dealer}")
+    if drew:
+        text += f"\nYou drew {card(drew)}"
     if result:
         text += f"\n*{result}*"
     blocks = [section(text)]
@@ -518,18 +524,28 @@ def bj_finish(g, natural=False):
     return f"{res} ({'+' if net >= 0 else '-'}{fmt(abs(net))})"
 
 
+def bj_timeout(gid):
+    """Walked away from a hand? It auto-stands (no free refund for abandoning a bad hand)."""
+    with lock:
+        g = games.get(gid)
+        if g:
+            bj_finish(g)
+
+
 @cmd("blackjack")
 def blackjack(uid, args):
     bet, err = check_bet(uid, args)
     if err:
         return err + "\nUsage: `/blackjack <bet|all>`"
     change(uid, cash=-bet)  # bet is held until the game ends
-    deck = [r for r in range(1, 14) for _ in range(4)]
+    deck = [(r, s) for r in range(1, 14) for s in SUITS]
     random.shuffle(deck)
     g = {"gid": uuid.uuid4().hex[:8], "uid": uid, "bet": bet, "deck": deck,
          "p": [deck.pop(), deck.pop()], "d": [deck.pop(), deck.pop()]}
     games[g["gid"]] = g
-    solo_timer(games, g["gid"])
+    t = threading.Timer(GAME_TIMEOUT, bj_timeout, args=(g["gid"],))
+    t.daemon = True
+    t.start()
     if hand_val(g["p"]) == 21:
         return bj_view(g, bj_finish(g, natural=True))
     return bj_view(g)
@@ -546,14 +562,16 @@ def bj_action(ack, body, respond, action):
         if body["user"]["id"] != g["uid"]:
             respond(text="❌ This isn't your game!", replace_original=False, response_type="ephemeral")
             return
+        drew = None
         if action["action_id"] == "bj_hit":
-            g["p"].append(g["deck"].pop())
+            drew = g["deck"].pop()
+            g["p"].append(drew)
             if hand_val(g["p"]) < 21:
-                view = render(bj_view(g), True)
+                view = render(bj_view(g, drew=drew), False)
                 respond(replace_original=True, blocks=view["blocks"], text=view["text"])
                 return
         result = bj_finish(g)
-        view = render(bj_view(g, result), True)
+        view = render(bj_view(g, result, drew), False)
         respond(replace_original=True, blocks=view["blocks"], text=view["text"])
 
 
@@ -977,15 +995,37 @@ def create_item(uid, args):
 # ---------- help (also shown when someone types @Hakari) ----------
 HELP_TEXT = ("*Hakari commands*\n"
              "`/balance [@user]` `/deposit <amt|all>` `/withdraw <amt|all>` `/give @user <amt|all>`\n"
-             "`/leaderboard` `/stats` `/work` `/crime` `/rob @user` `/collect`\n"
+             "`/leaderboard` `/stats` `/work` `/crime` `/collect`\n"
+             "`/rob @user` 50% to steal 40-90% of their cash, fail and you pay them 15-30% of yours "
+             "(keep money in the bank to be safe!)\n"
              "`/blackjack <bet|all>` win 2x, 21 = 3x, blackjack = 5x\n"
              "`/roulette <bet|all> <red|black|odd|even|0-36>` color/parity 2x, number 70x\n"
              "`/rps <bet|all>` (vs bot) win 2x, or `/rps @user [bet]` (vs a person) winner nets 2x the bet\n"
-             "(everything is private to you, except challenges to another person. Rob/give also DM the other person)\n"
              "`/ttt @user [bet]` tic tac toe vs a person\n"
              "`/catalog [item]` `/buy <item> [amt]` `/inventory` `/use <item> [amt]`\n"
              f"💬 Chatting earns {COIN} {CHAT_MIN}-{CHAT_MAX} every {CHAT_COOLDOWN}s.\n"
-             "Admins: `/add-money` `/create-item`")
+             "Solo games and money commands are private, only you see them. "
+             "Rob/give/challenges are public and ping the other person.\n"
+             "Admins: `/add-money` `/create-item` `/audit @user`")
+
+MENTION_TEXT = "🎰 *Check out my gambling bot!* You can earn prizes too 🏆 Be a robber, do crime.\n"
+
+
+@cmd("audit")
+def audit(uid, args):
+    if uid not in ADMINS:
+        return "🔒 Admins only."
+    if not args or not parse_user(args[0]):
+        return "❌ Usage: `/audit @user`"
+    target = parse_user(args[0])
+    with lock:
+        rows = db.execute("SELECT ts, cash, bank, why FROM log WHERE uid=? ORDER BY ts DESC LIMIT 20",
+                          (target,)).fetchall()
+    if not rows:
+        return "No logged money moves for that user yet."
+    lines = [f"`{time.strftime('%d %H:%M:%S', time.gmtime(t))}` cash {c:+,} bank {b:+,} ({w})"
+             for t, c, b, w in rows]
+    return f"*Last moves (UTC)* for {tag(target)}\n" + "\n".join(lines)
 
 
 @cmd("ecohelp")
@@ -994,12 +1034,9 @@ def ecohelp(uid, args):
 
 
 @app.event("app_mention")
-def on_mention(event, client, say):
-    try:  # only the person who mentioned the bot sees this
-        client.chat_postEphemeral(channel=event["channel"], user=event["user"], text=HELP_TEXT)
-    except Exception as e:
-        print("Ephemeral help failed, replying in thread:", repr(e))
-        say(text=HELP_TEXT, thread_ts=event.get("ts"))
+def on_mention(event, say):
+    # public reply (in a thread) so everyone sees the pitch + commands
+    say(text=MENTION_TEXT + HELP_TEXT, thread_ts=event.get("thread_ts") or event.get("ts"))
 
 
 def keep_alive_server():
