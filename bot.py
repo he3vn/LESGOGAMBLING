@@ -20,6 +20,90 @@ PRIVATE = {"balance", "deposit", "withdraw", "inventory", "catalog", "buy", "use
 
 # ---------- database ----------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")
+
+# ---------- free cloud backup of the coins (private GitHub repo) ----------
+# Set GITHUB_TOKEN (fine-grained token, "Contents: read & write" on ONE private repo)
+# and GITHUB_REPO ("yourname/hakari-data"). The database is restored on start and
+# saved every couple of minutes, so coins survive restarts on hosts with a wiped disk.
+import base64, json, signal, urllib.request, urllib.error
+
+GH_TOKEN, GH_REPO = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPO")
+GH_URL = f"https://api.github.com/repos/{GH_REPO}/contents/eco.db"
+gh_sha = None
+last_backup = None
+
+
+def gh(method="GET", data=None, raw=False):
+    req = urllib.request.Request(GH_URL, method=method, headers={
+        "Authorization": f"Bearer {GH_TOKEN}", "User-Agent": "hakari-bot",
+        "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json"})
+    if data is not None:
+        req.data = json.dumps(data).encode()
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read()
+        return body if raw else json.loads(body)
+
+
+def restore_db():
+    if not (GH_TOKEN and GH_REPO) or os.path.exists(DB_PATH):
+        return
+    try:
+        with open(DB_PATH, "wb") as f:
+            f.write(gh(raw=True))
+        print("Restored coins from GitHub backup.")
+    except urllib.error.HTTPError as e:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        print("No backup restored (first run?):", e.code)
+    except Exception as e:
+        print("Restore failed:", repr(e))
+
+
+def backup_db(force=False):
+    global gh_sha, last_backup
+    if not (GH_TOKEN and GH_REPO):
+        return
+    try:
+        tmp_path = DB_PATH + ".bak"
+        with lock:
+            dst = sqlite3.connect(tmp_path)
+            db.backup(dst)
+            dst.close()
+        with open(tmp_path, "rb") as f:
+            blob = f.read()
+        if blob == last_backup and not force:
+            return
+        payload = {"message": "backup", "content": base64.b64encode(blob).decode()}
+        for _ in range(2):
+            try:
+                if gh_sha is None:
+                    try:
+                        gh_sha = gh()["sha"]
+                    except urllib.error.HTTPError as e:
+                        if e.code != 404:
+                            raise
+                if gh_sha:
+                    payload["sha"] = gh_sha
+                gh_sha = gh("PUT", payload)["content"]["sha"]
+                last_backup = blob
+                return
+            except urllib.error.HTTPError as e:
+                if e.code in (409, 422):
+                    gh_sha = None  # out of date, refetch and retry
+                    payload.pop("sha", None)
+                    continue
+                raise
+    except Exception as e:
+        print("Backup failed:", repr(e))
+
+
+def backup_loop():
+    while True:
+        time.sleep(120)
+        backup_db()
+
+
+restore_db()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 lock = threading.RLock()
 db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash INTEGER DEFAULT 100, bank INTEGER DEFAULT 0)")
@@ -918,6 +1002,33 @@ def on_mention(event, client, say):
         say(text=HELP_TEXT, thread_ts=event.get("ts"))
 
 
+def keep_alive_server():
+    """Tiny web page so hosts like Render (which want an open port) accept the bot.
+    Point UptimeRobot at the service URL so the free instance never sleeps."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Hakari is running")
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("0.0.0.0", int(os.environ["PORT"])), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
 if __name__ == "__main__":
+    if os.environ.get("PORT"):
+        keep_alive_server()
+    if GH_TOKEN and GH_REPO:
+        threading.Thread(target=backup_loop, daemon=True).start()
+
+        def on_stop(*_):  # host is restarting us: save right now
+            backup_db()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, on_stop)
     print("Starting bot...")
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
