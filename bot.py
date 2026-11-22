@@ -22,15 +22,29 @@ PRIVATE = {"balance", "deposit", "withdraw", "inventory", "catalog", "buy", "use
 MENTION = {"rob", "give"}
 
 # ---------- database ----------
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")
+SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")  # a copy shipped in the code repo
 
 # ---------- free cloud backup of the coins (private GitHub repo) ----------
 # Set GITHUB_TOKEN (fine-grained token, "Contents: read & write" on ONE private repo)
 # and GITHUB_REPO ("yourname/hakari-data"). The database is restored on start and
 # saved every 10 seconds when something changed, so coins survive restarts on hosts with a wiped disk.
-import base64, json, signal, urllib.request, urllib.error
+import base64, json, shutil, signal, urllib.request, urllib.error
 
-GH_TOKEN, GH_REPO = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPO")
+def _clean_repo(r):
+    r = (r or "").strip()
+    for p in ("https://github.com/", "http://github.com/", "github.com/"):
+        if r.startswith(p):
+            r = r[len(p):]
+    r = r.strip("/")
+    return r[:-4] if r.endswith(".git") else r
+
+
+GH_TOKEN = (os.environ.get("GITHUB_TOKEN") or "").strip() or None
+GH_REPO = _clean_repo(os.environ.get("GITHUB_REPO")) or None
+# With the cloud backup on, the live database is a separate file that is ALWAYS loaded from the
+# backup at startup. An old eco.db that sits in the code repo is never used as the live database.
+DB_PATH = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "hakari_live.db")
+           if (GH_TOKEN and GH_REPO) else SEED_PATH)
 GH_URL = f"https://api.github.com/repos/{GH_REPO}/contents/eco.db"
 gh_sha = None
 last_backup = None
@@ -68,10 +82,9 @@ def restore_db():
         print("!! BACKUP IS OFF: set GITHUB_TOKEN and GITHUB_REPO or coins reset on every restart !!")
         return
     status["backup"] = f"ON ({GH_REPO})"
-    if os.path.exists(DB_PATH):
-        synced = True
-        status["restore"] = "kept the local database file"
-        return
+    for f in (DB_PATH, DB_PATH + ".bak"):  # never trust a leftover file, the backup is the truth
+        if os.path.exists(f):
+            os.remove(f)
     try:
         with open(DB_PATH, "wb") as f:
             f.write(gh(raw=True))
@@ -83,14 +96,19 @@ def restore_db():
             os.remove(DB_PATH)
         if e.code == 404 and repo_ok():
             synced = True
-            status["restore"] = "no backup file yet (first run), starting fresh"
-            print("No backup file yet (first run), starting fresh.")
+            if os.path.exists(SEED_PATH):
+                shutil.copyfile(SEED_PATH, DB_PATH)
+                status["restore"] = "no backup yet: started from the eco.db snapshot in the code repo"
+                print("No backup yet: seeded from the eco.db snapshot.")
+            else:
+                status["restore"] = "no backup yet (first run), starting fresh"
+                print("No backup yet (first run), starting fresh.")
         else:
-            sys.exit(f"!! Could not read the coin backup (HTTP {e.code}). Refusing to start so the saved "
-                     f"coins are not overwritten. Check GITHUB_TOKEN (Contents: read+write) and GITHUB_REPO.")
+            sys.exit(f"!! Could not read the coin backup (HTTP {e.code}) for GITHUB_REPO='{GH_REPO}'. "
+                     f"Refusing to start so coins are not overwritten. GITHUB_REPO must look like "
+                     f"yourname/hakari-data, the repo must exist, and the token must be allowed on THAT repo "
+                     f"with Contents: Read and write.")
     except Exception as e:
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
         sys.exit(f"!! Could not read the coin backup ({e!r}). Refusing to start so coins are not overwritten.")
 
 
