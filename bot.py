@@ -3,6 +3,8 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.webhook import WebhookClient
 
+sys.stdout.reconfigure(line_buffering=True)  # show print() lines in the Render logs right away
+
 if "SLACK_BOT_TOKEN" not in os.environ or "SLACK_APP_TOKEN" not in os.environ:
     sys.exit("Missing tokens. Run the two `export` lines first (see instructions).")
 
@@ -45,24 +47,56 @@ def gh(method="GET", data=None, raw=False):
         return body if raw else json.loads(body)
 
 
+synced = False  # True only once we KNOW what is in the backup (so we never overwrite it blindly)
+status = {"backup": "OFF (GITHUB_TOKEN / GITHUB_REPO missing: coins are NOT saved!)",
+          "restore": "not tried", "last_save": "never", "last_error": "none"}
+
+
+def repo_ok():
+    req = urllib.request.Request(f"https://api.github.com/repos/{GH_REPO}", headers={
+        "Authorization": f"Bearer {GH_TOKEN}", "User-Agent": "hakari-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            return True
+    except Exception:
+        return False
+
+
 def restore_db():
-    if not (GH_TOKEN and GH_REPO) or os.path.exists(DB_PATH):
+    global synced
+    if not (GH_TOKEN and GH_REPO):
+        print("!! BACKUP IS OFF: set GITHUB_TOKEN and GITHUB_REPO or coins reset on every restart !!")
+        return
+    status["backup"] = f"ON ({GH_REPO})"
+    if os.path.exists(DB_PATH):
+        synced = True
+        status["restore"] = "kept the local database file"
         return
     try:
         with open(DB_PATH, "wb") as f:
             f.write(gh(raw=True))
+        synced = True
+        status["restore"] = "restored coins from backup"
         print("Restored coins from GitHub backup.")
     except urllib.error.HTTPError as e:
         if os.path.exists(DB_PATH):
             os.remove(DB_PATH)
-        print("No backup restored (first run?):", e.code)
+        if e.code == 404 and repo_ok():
+            synced = True
+            status["restore"] = "no backup file yet (first run), starting fresh"
+            print("No backup file yet (first run), starting fresh.")
+        else:
+            sys.exit(f"!! Could not read the coin backup (HTTP {e.code}). Refusing to start so the saved "
+                     f"coins are not overwritten. Check GITHUB_TOKEN (Contents: read+write) and GITHUB_REPO.")
     except Exception as e:
-        print("Restore failed:", repr(e))
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        sys.exit(f"!! Could not read the coin backup ({e!r}). Refusing to start so coins are not overwritten.")
 
 
 def backup_db(force=False):
     global gh_sha, last_backup
-    if not (GH_TOKEN and GH_REPO):
+    if not (GH_TOKEN and GH_REPO) or not synced:
         return
     try:
         tmp_path = DB_PATH + ".bak"
@@ -87,14 +121,18 @@ def backup_db(force=False):
                     payload["sha"] = gh_sha
                 gh_sha = gh("PUT", payload)["content"]["sha"]
                 last_backup = blob
+                status["last_save"] = time.strftime("%H:%M:%S UTC", time.gmtime())
                 return
             except urllib.error.HTTPError as e:
                 if e.code in (409, 422):
+                    print("!! Backup changed under us: is ANOTHER copy of the bot running? "
+                          "(stop your Mac's copy / old deploys)")
                     gh_sha = None  # out of date, refetch and retry
                     payload.pop("sha", None)
                     continue
                 raise
     except Exception as e:
+        status["last_error"] = repr(e)
         print("Backup failed:", repr(e))
 
 
@@ -1048,7 +1086,7 @@ def keep_alive_server():
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Hakari is running")
+            self.wfile.write(("Hakari is running\n" + "\n".join(f"{k}: {v}" for k, v in status.items())).encode())
 
         def log_message(self, *a):
             pass
