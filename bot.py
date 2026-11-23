@@ -160,9 +160,6 @@ db.execute("CREATE TABLE IF NOT EXISTS items (name TEXT PRIMARY KEY, price INTEG
 db.execute("CREATE TABLE IF NOT EXISTS inv (uid TEXT, name TEXT, amount INTEGER, PRIMARY KEY (uid, name))")
 db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash INTEGER, bank INTEGER, why TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT)")
-db.execute("CREATE TABLE IF NOT EXISTS earned (uid TEXT, ts REAL, amt INTEGER)")
-db.execute("CREATE INDEX IF NOT EXISTS earned_uid ON earned (uid, ts)")
-db.execute("CREATE TABLE IF NOT EXISTS snap (uid TEXT PRIMARY KEY, cash INTEGER, bank INTEGER)")
 for col in ("name TEXT", "last_seen REAL"):
     try:
         db.execute(f"ALTER TABLE users ADD COLUMN {col}")
@@ -171,7 +168,7 @@ for col in ("name TEXT", "last_seen REAL"):
 db.execute("UPDATE users SET last_seen=? WHERE last_seen IS NULL AND (cash+bank) > 100", (time.time(),))
 db.commit()
 
-COIN = os.environ.get("COIN", "🪙")  # normal Slack coin. Set COIN in Render only if you want another icon
+COIN = os.environ.get("COIN", "🪙")  # set COIN in Render to a custom emoji (e.g. :hakari-coin:) to change the coin icon
 COOLDOWNS = {"work": 60, "crime": 60, "rob": 120, "collect": 86400}  # seconds (admins have none)
 GAME_TIMEOUT = 300  # seconds before an unfinished game is cleaned up
 PVP_BONUS = 1       # extra bets the house adds to the winner of a person-vs-person game (0 = zero-sum, safest vs alts)
@@ -279,13 +276,7 @@ def tag(uid):
 
 def render(obj, ping):
     if isinstance(obj, str):
-        def sub(m):
-            if ping:
-                return f"<@{m.group(1)}>"
-            n = name_of(m.group(1))
-            # already inside *bold*? then plain name, otherwise we get **Name*'s
-            return n if obj.count("*", 0, m.start()) % 2 else f"*{n}*"
-        return MARK.sub(sub, obj)
+        return MARK.sub(lambda m: f"<@{m.group(1)}>" if ping else f"*{name_of(m.group(1))}*", obj)
     if isinstance(obj, dict):
         return {k: render(v, ping) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -313,9 +304,6 @@ HELP_BTN = btn("❓ Help", "show_help")
 
 
 def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="ephemeral", nolog=False):
-    if getattr(cur, "capped", False):
-        cur.capped = False
-        footer = (footer + " · " if footer else "") + "🚫 daily earning limit reached, come back later"
     blocks = [section(text, fields)]
     if footer:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
@@ -329,18 +317,10 @@ def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="epheme
     return d
 
 
-def wire(d):
-    """Slack shows `text` AND the attachment when both are sent (double message). Send only the attachment."""
-    d = dict(d)
-    if d.get("attachments"):
-        d.pop("text", None)
-    return d
-
-
 def swap(respond, view):
     """Replace the message a button was clicked on."""
-    v = wire(render(view, False))
-    respond(replace_original=True, **v)
+    v = render(view, False)
+    respond(replace_original=True, text=v["text"], attachments=v["attachments"])
 
 
 def only_you(respond, text):
@@ -467,29 +447,8 @@ def wealth_factor(uid):
     return 1.0
 
 
-DAILY_CAP = 1_000_000  # most coins one person can EARN (game wins, work, crime, chat) per rolling 24h. /admin limit changes it
-
-
-def earn_cap(uid, amt):
-    """Returns how much of `amt` the person may still earn today (and records it)."""
-    if amt <= 0 or uid in ADMINS:
-        return amt
-    cap, now = setting("daily_cap", DAILY_CAP), time.time()
-    with lock:
-        used = db.execute("SELECT COALESCE(SUM(amt),0) FROM earned WHERE uid=? AND ts>?", (uid, now - 86400)).fetchone()[0]
-        ok = max(0, min(amt, cap - used))
-        if ok:
-            db.execute("INSERT INTO earned VALUES (?,?,?)", (uid, now, ok))
-        if random.random() < 0.01:
-            db.execute("DELETE FROM earned WHERE ts < ?", (now - 86400,))
-        db.commit()
-    if ok < amt:
-        cur.capped = True
-    return ok
-
-
 def win_profit(uid, bet, mult):
-    return earn_cap(uid, max(1, int(bet * mult * wealth_factor(uid))))
+    return max(1, int(bet * mult * wealth_factor(uid)))
 
 
 def inv_amount(uid, name):
@@ -529,10 +488,6 @@ def cmd(name, keep_case=False):
             # lowercase everything except @mentions (user IDs are case-sensitive)
             args = tokens if keep_case else [t if t.startswith("<") else t.lower() for t in tokens]
             cur.channel, cur.url = command.get("channel_id"), command.get("response_url")
-            cur.capped = False
-            if uid not in ADMINS and setting(f"ban:{uid}", 0):
-                respond("🔒 You're blocked from the economy.", response_type="ephemeral")
-                return
             try:
                 with lock:  # one command at a time: no double-spending with fast clicks
                     out = fn(uid, args)
@@ -544,7 +499,7 @@ def cmd(name, keep_case=False):
             nolog = False
             if isinstance(out, dict):
                 nolog = out.pop("nolog", False)
-                respond(**wire(render(out, False)))
+                respond(**render(out, False))
                 text = out.get("text", "")
             else:
                 private = cname not in PUBLIC or out.startswith(("❌", "⏱", "🔒"))
@@ -651,42 +606,18 @@ def give(uid, args):
     return f"✅ {tag(uid)} gave {fmt(amt)} to {tag(target)}."
 
 
-LB_SIZE = 10
-
-
-def lb_view(uid, page):
-    with lock:
-        total = db.execute("SELECT COUNT(*) FROM users WHERE cash+bank > 0").fetchone()[0]
-        pages = max(1, -(-total // LB_SIZE))
-        page = max(1, min(page, pages))
-        rows = db.execute("SELECT uid, cash+bank AS t FROM users WHERE cash+bank > 0 ORDER BY t DESC, uid LIMIT ? OFFSET ?",
-                          (LB_SIZE, (page - 1) * LB_SIZE)).fetchall()
-        mine = sum(get(uid))
-        rank = db.execute("SELECT COUNT(*) FROM users WHERE cash+bank > ?", (mine,)).fetchone()[0] + 1
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    start = (page - 1) * LB_SIZE
-    lines = "\n".join(f"{medals.get(start + i, f'`{start + i}.`')} {tag(u)} • {fmt(t)}"
-                      for i, (u, t) in enumerate(rows, 1))
-    buttons = []
-    if page > 1:
-        buttons.append(btn("◀ Prev", "lb_page", f"{uid}:{page - 1}"))
-    if page < pages:
-        buttons.append(btn("Next ▶", "lb_page", f"{uid}:{page + 1}", "primary"))
-    return embed(f"🏆 *Leaderboard*\n{lines or 'Nobody here yet.'}", C_GOLD, nolog=True, buttons=buttons or None,
-                 footer=f"Page {page}/{pages} · Your leaderboard rank: {ordinal(rank)} · {fmt(mine)}")
-
-
 @cmd("leaderboard")
 def leaderboard(uid, args):
-    page = int(args[0]) if args and args[0].isdigit() else 1
-    return lb_view(uid, page)
-
-
-@app.action("lb_page")
-def lb_page(ack, body, respond, action):
-    ack()
-    uid, page = action["value"].split(":")
-    swap(respond, lb_view(body["user"]["id"], int(page)))
+    with lock:
+        rows = db.execute("SELECT uid, cash+bank AS t FROM users ORDER BY t DESC LIMIT 10").fetchall()
+        mine = sum(get(uid))
+        rank = db.execute("SELECT COUNT(*) FROM users WHERE cash+bank > ?", (mine,)).fetchone()[0] + 1
+    if not rows:
+        return "❌ Nobody has played yet!"
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = "\n".join(f"{medals.get(i, f'`{i}.`')} {tag(u)} • {fmt(t)}" for i, (u, t) in enumerate(rows, 1))
+    return embed(f"🏆 *Leaderboard*\n{lines}", C_GOLD, nolog=True,
+                 footer=f"Your leaderboard rank: {ordinal(rank)} · {fmt(mine)}")
 
 
 @cmd("stats")
@@ -707,7 +638,6 @@ def work(uid, args):
     pay = random.randint(100, 350)
     job = random.choice(["delivered pizzas 🍕", "fixed some bugs 🐛", "walked dogs 🐕",
                          "mowed lawns 🌱", "freelanced 👨‍💻", "washed cars 🚗", "tutored a kid 📚"])
-    pay = earn_cap(uid, pay)
     change(uid, cash=pay)
     return embed(f"You {job} and earned {fmt(pay)}.", C_GREEN, buttons=[btn("⏱ Remind me", "remind", "work")])
 
@@ -726,7 +656,7 @@ def crime(uid, args):
         return wait_view("crime", left)
     remind = [btn("⏱ Remind me", "remind", "crime")]
     if random.random() < 0.60:
-        win = earn_cap(uid, random.randint(200, 900))
+        win = random.randint(200, 900)
         change(uid, cash=win)
         return embed(f"🕵️ You {random.choice(CRIME_WIN)} and got {fmt(win)}.", C_GREEN, buttons=remind)
     cash, bank = get(uid)
@@ -796,9 +726,7 @@ def on_message(event):
     if now - chat_last.get(uid, 0) < CHAT_COOLDOWN:
         return
     chat_last[uid] = now
-    if setting(f"ban:{uid}", 0):
-        return
-    change(uid, cash=earn_cap(uid, random.randint(CHAT_MIN, CHAT_MAX)))
+    change(uid, cash=random.randint(CHAT_MIN, CHAT_MAX))
     touch(uid)
 
 
@@ -858,13 +786,13 @@ def bj_view(g, finished=False):
     if finished:
         label, profit = g["result"]
         color = C_GREEN if profit > 0 else (C_GREY if profit == 0 else C_RED)
-        head = f"*Result:* {label}  *{signed(profit)}*"
-        dealer = f"{show(g['d'])}\nValue: {hand_val(g['d'])}"
+        head = f"*Result:* {label}  {signed(profit)}"
+        dealer = f"{show(g['d'])}\n\nValue: {hand_val(g['d'])}"
         buttons = [btn("▶️ Play Again", "bj_again", f"{g['uid']}:{g['bet0']}", "primary"), HELP_BTN]
     else:
         color = C_BLUE
         head = f"🃏 *Blackjack* · {tag(g['uid'])} · bet {fmt(g['bet'])}"
-        dealer = f"{card(g['d'][0])} `?`\nValue: ?"
+        dealer = f"{card(g['d'][0])} `?`\n\nValue: ?"
         buttons = [btn("Hit", "bj_hit", g["gid"], "primary"), btn("Stand", "bj_stand", g["gid"])]
         if len(g["p"]) == 2 and get(g["uid"])[0] >= g["bet"]:
             buttons.append(btn("Double Down", "bj_double", g["gid"]))
@@ -873,7 +801,7 @@ def bj_view(g, finished=False):
     if finished:
         text = f"🃏 *Blackjack* · {tag(g['uid'])} · bet {fmt(g['bet'])}\n{head}"
     return embed(text, color, nolog=True, buttons=buttons, footer=f"Cards remaining: {len(g['deck'])}",
-                 fields=[f"*Your Hand*\n{show(g['p'])}\nValue: {hand_val(g['p'])}", f"*Dealer Hand*\n{dealer}"])
+                 fields=[f"*Your Hand*\n{show(g['p'])}\n\nValue: {hand_val(g['p'])}", f"*Dealer Hand*\n{dealer}"])
 
 
 def bj_finish(g, natural=False):
@@ -931,8 +859,6 @@ def bj_new(uid, bet_text):
 
 @cmd("blackjack")
 def blackjack(uid, args):
-    if args and args[0].startswith("<"):
-        return make_challenge(uid, args, "bj")  # blackjack vs a person
     return bj_new(uid, args[0] if args else "")
 
 
@@ -1007,7 +933,7 @@ def slots_play(uid, bet_text):
         change(uid, cash=bet + profit)
     glog(uid, f"spun the slots (bet {fmt(bet)})", f"{' '.join(reels)} {label} {signed(profit)}")
     color = C_GREEN if profit > 0 else C_RED
-    return embed(f"🎰 *Slots* · {tag(uid)} · bet {fmt(bet)}\n\n>  {'   |   '.join(reels)}\n\n*Result:* {label}  *{signed(profit)}*",
+    return embed(f"🎰 *Slots* · {tag(uid)} · bet {fmt(bet)}\n\n>  {'   |   '.join(reels)}\n\n*Result:* {label}  {signed(profit)}",
                  color, nolog=True, footer="3x 7️⃣ = 30x · 3x 💎 = 15x · 3x 🔔 = 8x · any other 3 = 4x · pair = 1x",
                  buttons=[btn("🎰 Spin Again", "slots_again", f"{uid}:{bet}", "primary"), HELP_BTN])
 
@@ -1082,7 +1008,7 @@ def hl_action(ack, body, respond, action):
         glog(uid, f"played higher-lower (bet {fmt(bet)})", f"{card(c)} then {card(nxt)} {signed(profit)}")
         swap(respond, embed(
             f"🔼 *Higher or Lower* · {tag(uid)} · bet {fmt(bet)}\n\n{card(c)} → {card(nxt)}\n"
-            f"*Result:* {'You win!' if won else 'You lose'}  *{signed(profit)}*",
+            f"*Result:* {'You win!' if won else 'You lose'}  {signed(profit)}",
             C_GREEN if won else C_RED, nolog=True,
             buttons=[btn("▶️ Play Again", "hl_again", f"{uid}:{bet}", "primary"), HELP_BTN]))
 
@@ -1100,7 +1026,7 @@ def rr_play(uid, bet_text):
         change(uid, cash=bet + profit)
         text, color = "🔫 *click…* The chamber was empty, you survive!", C_GREEN
     glog(uid, f"played russian roulette (bet {fmt(bet)})", signed(profit))
-    return embed(f"{text}\n{tag(uid)} bet {fmt(bet)} · *Result:* *{signed(profit)}*", color, nolog=True,
+    return embed(f"{text}\n{tag(uid)} bet {fmt(bet)} · *Result:* {signed(profit)}", color, nolog=True,
                  footer="1 bullet in 6 chambers. Survive to win 20% of your bet.",
                  buttons=[btn("🔫 Again", "rr_again", f"{uid}:{bet}", "danger"), HELP_BTN])
 
@@ -1158,14 +1084,14 @@ def rps_action(ack, body, respond, action):
         rps_games.pop(action["value"], None)
         glog(uid, f"played rps vs the bot (bet {fmt(bet)})", f"{me} vs {bot_move}: {res} {signed(profit)}")
         swap(respond, embed(f"✊ *Rock Paper Scissors* · {tag(uid)} bet {fmt(bet)}\n"
-                            f"You: {RPS[me]} {me}  vs  Bot: {RPS[bot_move]} {bot_move}\n*{res}*  *{signed(profit)}*",
+                            f"You: {RPS[me]} {me}  vs  Bot: {RPS[bot_move]} {bot_move}\n*{res}*  {signed(profit)}",
                             color, nolog=True, buttons=[HELP_BTN]))
 
 
 # ---------- roulette: shared table, everybody in the channel can join ----------
 RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 roulette_games = {}  # channel id -> running game
-ROUL_JOIN, ROUL_MAX = 10, 60  # seconds after each bet / total
+ROUL_JOIN, ROUL_MAX = 15, 60  # seconds after each bet / total
 
 
 def roulette_space(space):
@@ -1200,8 +1126,6 @@ def roulette(uid, args):
     if err:
         return with_usage(err, ROUL_USAGE)
     ch, now = cur.channel, time.time()
-    if any(b[0] == uid for rg in roulette_games.values() for b in rg["bets"]):
-        return "❌ You already have a bet on the table, wait for the spin."
     change(uid, cash=-bet)  # held until the wheel stops
     g = roulette_games.get(ch)
     new = g is None
@@ -1231,32 +1155,29 @@ def roulette_spin(ch):
         n = random.randint(0, 36)
         color = "green" if n == 0 else ("red" if n in RED else "black")
         results = {}
-        capped = set()
         for uid, bet, raw, (label, mult, test) in g["bets"]:
             r = results.setdefault(uid, [0, 0])
             if test(n):
                 profit = win_profit(uid, bet, mult)
                 change(uid, cash=bet + profit)
                 r[0] += profit
-                if profit < int(bet * mult * wealth_factor(uid)):
-                    capped.add(uid)
             else:
                 r[1] += bet
         lines = []
         for uid, (won, lost) in results.items():
             net = won - lost
-            lines.append(f"{'✅' if net > 0 else ('➖' if net == 0 else '❌')} <@{uid}> *{signed(net)}*" + (" 🚫 daily limit" if uid in capped else ""))
+            lines.append(f"{'✅' if net > 0 else ('➖' if net == 0 else '❌')} <@{uid}> {signed(net)}")
             glog(uid, "played roulette", f"ball on {color} {n}: {signed(net)}")
         total = sum(b[1] for b in g["bets"])
     text = f"🎡 *The ball landed on {color} {n}!*\n" + "\n".join(lines)
     body = {"text": text.replace("*", ""), "attachments": [{"color": {"red": C_RED, "black": C_GREY, "green": C_GREEN}[color],
             "blocks": [section(text), {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{len(results)} player(s) · {fmt(total)} bet in total"}]}]}]}
     try:
-        app.client.chat_postMessage(channel=ch, **wire(body))
+        app.client.chat_postMessage(channel=ch, **body)
     except Exception as e:
         print("roulette result via chat.postMessage failed, trying response_url:", repr(e))
         try:
-            WebhookClient(g["url"]).send(response_type="in_channel", **wire(body))
+            WebhookClient(g["url"]).send(response_type="in_channel", **body)
         except Exception as e2:
             print("roulette result could not be posted:", repr(e2))
 
@@ -1264,23 +1185,15 @@ def roulette_spin(ch):
 # ---------- 2-player games: challenges, rock paper scissors, tic tac toe (public) ----------
 challenges = {}  # waiting for the other person to accept
 pvp = {}         # running 2-player games
-GAME_NAMES = {"rps": "Rock Paper Scissors", "ttt": "Tic Tac Toe", "bj": "Blackjack"}
+GAME_NAMES = {"rps": "Rock Paper Scissors", "ttt": "Tic Tac Toe"}
 
 
 def stake_text(bet):
     return f"{fmt(bet)} each" if bet else "no bet"
 
 
-def pvp_win(winner, bet):
-    """Pays the winner both bets + the house bonus (the bonus counts toward the daily earning limit). Returns the gain."""
-    bonus = earn_cap(winner, bet * PVP_BONUS)
-    change(winner, cash=bet * 2 + bonus)
-    return bet + bonus
-
-
-def win_text(winner, loser, bet, gain=None):
-    gain = bet * (1 + PVP_BONUS) if gain is None else gain
-    return f"🏆 {tag(winner)} wins" + (f" *{fmt(gain)}* ({tag(loser)} loses {fmt(bet)})!" if bet else "!")
+def win_text(winner, loser, bet):
+    return f"🏆 {tag(winner)} wins" + (f" {fmt(bet * (1 + PVP_BONUS))} ({tag(loser)} loses {fmt(bet)})!" if bet else "!")
 
 
 def forget_challenge(gid):
@@ -1381,22 +1294,12 @@ def ch_action(ack, body, respond, action):
              "url": body.get("response_url"), "timer": None}
         if g["kind"] == "rps":
             g["picks"] = {}
-        elif g["kind"] == "bj":
-            deck = [(r, sd) for r in range(1, 14) for sd in SUITS]
-            random.shuffle(deck)
-            g["deck"] = deck
-            g["h"] = {g["a"]: [deck.pop(), deck.pop()], g["b"]: [deck.pop(), deck.pop()]}
-            g["done"] = {u for u in (g["a"], g["b"]) if hand_val(g["h"][u]) == 21}
         else:
             g["board"] = [None] * 9
             g["turn"] = g["a"]
         pvp[gid] = g
         arm(g)
-        if g["kind"] == "bj" and len(g["done"]) == 2:
-            pvp.pop(gid, None)
-            replace(respond, bj2_result(g))
-            return
-        view = rps_view(g) if g["kind"] == "rps" else (bj2_view(g) if g["kind"] == "bj" else ttt_view(g))
+        view = rps_view(g) if g["kind"] == "rps" else ttt_view(g)
         respond(replace_original=True, **render(view, False))
 
 
@@ -1444,81 +1347,10 @@ def prps_action(ack, body, respond, action):
             res = "Tie, bets returned."
         else:
             winner, loser = (a, b) if BEATS[pa] == pb else (b, a)
-            res = win_text(winner, loser, bet, pvp_win(winner, bet))
+            change(winner, cash=bet * (2 + PVP_BONUS))  # both bets back + the house bonus
+            res = win_text(winner, loser, bet)
         glog(a, f"played rps vs {tag(b)}", res.replace("🏆 ", ""))
         replace(respond, head + res)
-
-
-# --- 2-player blackjack: each person has their own hand, highest total up to 21 wins ---
-def bj2_state(g, u):
-    v = hand_val(g["h"][u])
-    return "💥 bust" if v > 21 else ("✋ stood" if u in g["done"] else "🤔 playing")
-
-
-def bj2_view(g):
-    text = (f"🃏 *Blackjack* | {tag(g['a'])} vs {tag(g['b'])} ({stake_text(g['bet'])})\n"
-            + "\n".join(f"{tag(u)}: {bj2_state(g, u)} · {len(g['h'][u])} cards" for u in (g["a"], g["b"])))
-    buttons = [btn("Hit", "pbj_hit", g["gid"], "primary"), btn("Stand", "pbj_stand", g["gid"]),
-               btn("👀 My hand", "pbj_hand", g["gid"])]
-    return {"text": text, "blocks": [section(text), {"type": "actions", "elements": buttons}]}
-
-
-def bj2_result(g):
-    """Pays out and returns the final message text."""
-    a, b, bet = g["a"], g["b"], g["bet"]
-    va, vb = hand_val(g["h"][a]), hand_val(g["h"][b])
-    sa, sb = (0 if va > 21 else va), (0 if vb > 21 else vb)
-    head = (f"🃏 *Blackjack* | {tag(a)} {show(g['h'][a])} = *{va}*  vs  "
-            f"{tag(b)} {show(g['h'][b])} = *{vb}*\n")
-    if sa == sb:
-        change(a, cash=bet)
-        change(b, cash=bet)
-        res = "Tie, bets returned."
-    else:
-        winner, loser = (a, b) if sa > sb else (b, a)
-        res = win_text(winner, loser, bet, pvp_win(winner, bet))
-    glog(a, f"played blackjack vs {tag(b)}", res.replace("🏆 ", ""))
-    return head + res
-
-
-@app.action(re.compile(r"^pbj_(hit|stand|hand)$"))
-def pbj_action(ack, body, respond, action):
-    ack()
-    with lock:
-        g = pvp.get(action["value"])
-        user = body["user"]["id"]
-        if not g:
-            only_you(respond, "That game has ended.")
-            return
-        if user not in (g["a"], g["b"]):
-            only_you(respond, "❌ This isn't your game!")
-            return
-        h = g["h"][user]
-        kind = action["action_id"][4:]
-        mine = lambda: f"Your hand: {show(h)} = *{hand_val(h)}*"
-        if kind == "hand":
-            only_you(respond, mine())
-            return
-        if user in g["done"]:
-            only_you(respond, f"You're done, waiting for your opponent.\n{mine()}")
-            return
-        g["url"] = body.get("response_url") or g["url"]
-        if kind == "hit":
-            h.append(g["deck"].pop())
-            if hand_val(h) >= 21:
-                g["done"].add(user)
-        else:
-            g["done"].add(user)
-        busted = any(hand_val(g["h"][u]) > 21 for u in (g["a"], g["b"]))
-        if busted or len(g["done"]) == 2:
-            if g["timer"]:
-                g["timer"].cancel()
-            pvp.pop(g["gid"], None)
-            replace(respond, bj2_result(g))
-            return
-        arm(g)
-        respond(replace_original=True, **render(bj2_view(g), False))
-        only_you(respond, mine())
 
 
 # --- tic tac toe (board is emoji text + a dropdown, because Slack mobile stacks buttons vertically) ---
@@ -1587,7 +1419,8 @@ def ttt_action(ack, body, respond, action):
             bet = g["bet"]
             if won:
                 other = g["b"] if user == g["a"] else g["a"]
-                res = win_text(user, other, bet, pvp_win(user, bet))
+                change(user, cash=bet * (2 + PVP_BONUS))
+                res = win_text(user, other, bet)
             else:
                 change(g["a"], cash=bet)
                 change(g["b"], cash=bet)
@@ -1675,167 +1508,6 @@ def create_item(uid, args):
     return f"✅ Item `{name}` created for {fmt(int(args[1]))}."
 
 
-@cmd("delete-item")
-def delete_item(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
-    if not args:
-        return "❌ Usage: `/delete-item <name>`"
-    return remove_item(args[0].lower())
-
-
-def remove_item(name):
-    with lock:
-        n = db.execute("DELETE FROM items WHERE name=?", (name,)).rowcount
-        held = db.execute("DELETE FROM inv WHERE name=?", (name,)).rowcount
-        db.commit()
-    return f"✅ Item `{name}` deleted (removed from {held} inventories)." if n else f"❌ No item called `{name}`."
-
-
-ADMIN_HELP = (
-    "*🛠 /admin commands*\n"
-    "`nuke @user`: wipe their cash and bank\n"
-    "`nuke all confirm`: wipe EVERYONE's cash and bank\n"
-    "`cap @user <amount>` / `cap all <amount>`: cut total coins down to the amount (cash first)\n"
-    "`set @user <cash> [bank]` · `take @user <amount|all>` · `giveall <amount>` (cash to everyone)\n"
-    "`undo`: restore the last nuke/cap/set/take\n"
-    "`resetcd @user|all`: clear cooldowns · `limit [amount]`: daily earning limit (now/change)\n"
-    "`ban @user` / `unban @user`: block from the economy · `info @user`: balance + earned today\n"
-    "`item-remove <name>`: delete an item (also `/delete-item`)\n"
-    "Money changes can be checked with `/audit @user`.")
-
-
-def snapshot(uids):
-    with lock:
-        db.execute("DELETE FROM snap")
-        for u in uids:
-            c, b = get(u)
-            db.execute("INSERT INTO snap VALUES (?,?,?)", (u, c, b))
-        db.commit()
-
-
-def set_money(u, cash, bank):
-    c, b = get(u)
-    change(u, cash=cash - c, bank=bank - b)
-
-
-def all_uids():
-    with lock:
-        return [r[0] for r in db.execute("SELECT uid FROM users").fetchall()]
-
-
-def cap_total(u, amt):
-    c, b = get(u)
-    if c + b <= amt:
-        return False
-    nc = min(c, amt)
-    set_money(u, nc, min(b, amt - nc))
-    return True
-
-
-@cmd("admin")
-def admin_cmd(uid, args):
-    if uid not in ADMINS:
-        return "🔒 Admins only."
-    if not args or args[0] == "help":
-        return ADMIN_HELP
-    sub, rest = args[0], args[1:]
-    tgt = parse_user(rest[0]) if rest else None
-    if sub == "nuke":
-        if rest and rest[0] == "all":
-            if rest[1:] != ["confirm"]:
-                return "⚠️ This wipes EVERYONE's cash and bank. Run `/admin nuke all confirm` to do it (`/admin undo` can restore it)."
-            ids = all_uids()
-            snapshot(ids)
-            for u in ids:
-                set_money(u, 0, 0)
-            return f"☢️ Nuked everyone ({len(ids)} players) to 0."
-        if not tgt:
-            return "❌ Usage: `/admin nuke @user` or `/admin nuke all confirm`"
-        snapshot([tgt])
-        set_money(tgt, 0, 0)
-        return f"☢️ Nuked {tag(tgt)} to 0."
-    if sub == "cap":
-        amt = parse_amount(rest[1], 0) if len(rest) > 1 else None
-        if amt is None or not (tgt or rest[0] == "all"):
-            return "❌ Usage: `/admin cap @user <amount>` or `/admin cap all <amount>`"
-        ids = all_uids() if rest[0] == "all" else [tgt]
-        snapshot(ids)
-        n = sum(cap_total(u, amt) for u in ids)
-        return f"✅ Capped {n} player(s) to {fmt(amt)} total."
-    if sub == "set":
-        if not tgt or len(rest) < 2 or not rest[1].isdigit() or (len(rest) > 2 and not rest[2].isdigit()):
-            return "❌ Usage: `/admin set @user <cash> [bank]`"
-        snapshot([tgt])
-        set_money(tgt, int(rest[1]), int(rest[2]) if len(rest) > 2 else get(tgt)[1])
-        return f"✅ {tag(tgt)} now has {fmt(get(tgt)[0])} cash and {fmt(get(tgt)[1])} bank."
-    if sub == "take":
-        if not tgt or len(rest) < 2:
-            return "❌ Usage: `/admin take @user <amount|all>`"
-        c, b = get(tgt)
-        amt = parse_amount(rest[1], c + b)
-        if not amt or amt < 1:
-            return "❌ Usage: `/admin take @user <amount|all>`"
-        amt = min(amt, c + b)
-        snapshot([tgt])
-        from_cash = min(c, amt)
-        change(tgt, cash=-from_cash, bank=-(amt - from_cash))
-        return f"✅ Took {fmt(amt)} from {tag(tgt)}."
-    if sub == "giveall":
-        amt = parse_amount(rest[0], 0) if rest else None
-        if not amt:
-            return "❌ Usage: `/admin giveall <amount>`"
-        ids = all_uids()
-        for u in ids:
-            change(u, cash=amt)
-        return f"🎁 Gave {fmt(amt)} to {len(ids)} players."
-    if sub == "undo":
-        with lock:
-            rows = db.execute("SELECT uid, cash, bank FROM snap").fetchall()
-            db.execute("DELETE FROM snap")
-            db.commit()
-        if not rows:
-            return "❌ Nothing to undo."
-        for u, c, b in rows:
-            set_money(u, c, b)
-        return f"↩️ Restored {len(rows)} player(s) to how they were before the last change."
-    if sub == "resetcd":
-        with lock:
-            if tgt:
-                db.execute("DELETE FROM cooldowns WHERE uid=?", (tgt,))
-                game_hist.pop(tgt, None)
-            elif rest and rest[0] == "all":
-                db.execute("DELETE FROM cooldowns")
-                game_hist.clear()
-            else:
-                return "❌ Usage: `/admin resetcd @user` or `/admin resetcd all`"
-            db.commit()
-        return "✅ Cooldowns cleared."
-    if sub == "limit":
-        if rest:
-            amt = parse_amount(rest[0], 0)
-            if not amt:
-                return "❌ Usage: `/admin limit <amount>`"
-            set_setting("daily_cap", amt)
-        return f"✅ Daily earning limit is {fmt(setting('daily_cap', DAILY_CAP))} per person per 24h."
-    if sub in ("ban", "unban"):
-        if not tgt:
-            return f"❌ Usage: `/admin {sub} @user`"
-        set_setting(f"ban:{tgt}", 1 if sub == "ban" else 0)
-        return f"✅ {tag(tgt)} is {'blocked from' if sub == 'ban' else 'allowed back into'} the economy."
-    if sub == "info":
-        if not tgt:
-            return "❌ Usage: `/admin info @user`"
-        c, b = get(tgt)
-        with lock:
-            e = db.execute("SELECT COALESCE(SUM(amt),0) FROM earned WHERE uid=? AND ts>?", (tgt, time.time() - 86400)).fetchone()[0]
-        return (f"ℹ️ {tag(tgt)}: cash {fmt(c)} · bank {fmt(b)} · earned in the last 24h {fmt(e)} "
-                f"of {fmt(setting('daily_cap', DAILY_CAP))}{' · 🔒 blocked' if setting(f'ban:{tgt}', 0) else ''}")
-    if sub in ("item-remove", "remove-item", "delete-item"):
-        return remove_item(rest[0]) if rest else "❌ Usage: `/admin item-remove <name>`"
-    return ADMIN_HELP
-
-
 @cmd("set-bet-limit")
 def set_bet_limit(uid, args):
     usage = f"❌ Usage: `/set-bet-limit <game> <min|max> <amount>` (games: {', '.join(GAMES)})\nExample: `/set-bet-limit roulette max 2500`"
@@ -1901,7 +1573,7 @@ def help_blocks(admin=False):
         "`/deposit <amount|half|all>` – move cash into your bank so nobody can rob it.\n"
         "`/withdraw <amount|half|all>` – take money out of the bank.\n"
         "`/give @user <amount>` – send cash to someone. They get pinged.\n"
-        "`/lb` – leaderboard: the richest players, 10 per page, and your own rank (also `/leaderboard`).\n"
+        "`/lb` – leaderboard: the 10 richest players and your own rank (also `/leaderboard`).\n"
         "`/stats` – how many coins exist in total.",
 
         "*⛏️ Earn coins*\n"
@@ -1914,8 +1586,7 @@ def help_blocks(admin=False):
 
         "*🎰 Games vs the bot* (only you see them)\n"
         "`/bj <bet>` – blackjack (also `/blackjack`). Beat the dealer without going over 21. "
-        "Win pays 2x, a 21 pays 3x, natural blackjack 5x. Buttons: Hit, Stand, Double Down. "
-        "Or `/bj @user [bet]` to play a person: highest hand up to 21 wins.\n"
+        "Win pays 2x, a 21 pays 3x, natural blackjack 5x. Buttons: Hit, Stand, Double Down.\n"
         "`/slots <bet>` – 3 reels. Pair 1x, three of a kind 4x, up to 30x for triple 7️⃣.\n"
         "`/higher-lower <bet>` – guess if the next card is higher or lower. Riskier guesses pay more.\n"
         "`/russian-roulette <bet>` – 1 bullet in 6. Survive and win 20%, else lose the bet.\n"
@@ -1944,8 +1615,7 @@ def help_blocks(admin=False):
     ]
     if admin:
         parts.append("*🛠 Admin (only you can see this)*\n"
-                     "`/admin help` lists the admin tools (nuke, cap, set, take, undo, limit, ban, item-remove…)\n"
-                     "`/add-money @user <amount>` · `/create-item <name> <price> <description>` · `/delete-item <name>` · `/audit @user`\n"
+                     "`/add-money @user <amount>` · `/create-item <name> <price> <description>` · `/audit @user`\n"
                      "`/set-bet-limit <game> <min|max> <amount>` · `/set-blackjack-decks <1-8>` · "
                      "`/set-game-cooldown <usages> <duration>` (e.g. `4 5m`)")
     return [section(INTRO)] + [section(p) for p in parts]
