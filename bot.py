@@ -160,8 +160,6 @@ db.execute("CREATE TABLE IF NOT EXISTS items (name TEXT PRIMARY KEY, price INTEG
 db.execute("CREATE TABLE IF NOT EXISTS inv (uid TEXT, name TEXT, amount INTEGER, PRIMARY KEY (uid, name))")
 db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash INTEGER, bank INTEGER, why TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT)")
-db.execute("CREATE TABLE IF NOT EXISTS earned (uid TEXT, ts REAL, amt INTEGER)")
-db.execute("CREATE INDEX IF NOT EXISTS earned_uid ON earned (uid, ts)")
 db.execute("CREATE TABLE IF NOT EXISTS snap (uid TEXT PRIMARY KEY, cash INTEGER, bank INTEGER)")
 for col in ("name TEXT", "last_seen REAL"):
     try:
@@ -311,9 +309,6 @@ HELP_BTN = btn("❓ Help", "show_help")
 
 
 def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="ephemeral", nolog=False):
-    if getattr(cur, "capped", False):
-        cur.capped = False
-        footer = (footer + " · " if footer else "") + "🚫 daily earning limit reached, come back later"
     blocks = [section(text, fields)]
     if footer:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
@@ -407,7 +402,9 @@ def game_gate(uid):
     """Max N games per window (set with /set-game-cooldown). Returns an error text or None."""
     if uid in ADMINS:
         return None
-    uses, secs = setting("cd_uses", 8), setting("cd_secs", 60)
+    uses, secs = setting("cd_uses", 0), setting("cd_secs", 60)
+    if uses <= 0:
+        return None  # no limit unless an admin sets one with /set-game-cooldown
     now = time.time()
     h = [t for t in game_hist.get(uid, []) if now - t < secs]
     if len(h) >= uses:
@@ -460,29 +457,8 @@ def wealth_factor(uid):
     return 1.0
 
 
-DAILY_CAP = 1_000_000  # most coins one person can EARN (game wins, work, crime, chat) per rolling 24h. /admin limit changes it
-
-
-def earn_cap(uid, amt):
-    """Returns how much of `amt` the person may still earn today (and records it)."""
-    if amt <= 0 or uid in ADMINS:
-        return amt
-    cap, now = setting("daily_cap", DAILY_CAP), time.time()
-    with lock:
-        used = db.execute("SELECT COALESCE(SUM(amt),0) FROM earned WHERE uid=? AND ts>?", (uid, now - 86400)).fetchone()[0]
-        ok = max(0, min(amt, cap - used))
-        if ok:
-            db.execute("INSERT INTO earned VALUES (?,?,?)", (uid, now, ok))
-        if random.random() < 0.01:
-            db.execute("DELETE FROM earned WHERE ts < ?", (now - 86400,))
-        db.commit()
-    if ok < amt:
-        cur.capped = True
-    return ok
-
-
 def win_profit(uid, bet, mult):
-    return earn_cap(uid, max(1, int(bet * mult * wealth_factor(uid))))
+    return max(1, int(bet * mult * wealth_factor(uid)))
 
 
 def inv_amount(uid, name):
@@ -522,7 +498,6 @@ def cmd(name, keep_case=False):
             # lowercase everything except @mentions (user IDs are case-sensitive)
             args = tokens if keep_case else [t if t.startswith("<") else t.lower() for t in tokens]
             cur.channel, cur.url = command.get("channel_id"), command.get("response_url")
-            cur.capped = False
             if uid not in ADMINS and setting(f"ban:{uid}", 0):
                 respond("🔒 You're blocked from the economy.", response_type="ephemeral")
                 return
@@ -703,7 +678,6 @@ def work(uid, args):
     pay = random.randint(100, 350)
     job = random.choice(["delivered pizzas 🍕", "fixed some bugs 🐛", "walked dogs 🐕",
                          "mowed lawns 🌱", "freelanced 👨‍💻", "washed cars 🚗", "tutored a kid 📚"])
-    pay = earn_cap(uid, pay)
     change(uid, cash=pay)
     return embed(f"You {job} and earned {fmt(pay)}.", C_GREEN, buttons=[btn("⏱ Remind me", "remind", "work")])
 
@@ -722,7 +696,7 @@ def crime(uid, args):
         return wait_view("crime", left)
     remind = [btn("⏱ Remind me", "remind", "crime")]
     if random.random() < 0.60:
-        win = earn_cap(uid, random.randint(200, 900))
+        win = random.randint(200, 900)
         change(uid, cash=win)
         return embed(f"🕵️ You {random.choice(CRIME_WIN)} and got {fmt(win)}.", C_GREEN, buttons=remind)
     cash, bank = get(uid)
@@ -794,7 +768,7 @@ def on_message(event):
     chat_last[uid] = now
     if setting(f"ban:{uid}", 0):
         return
-    change(uid, cash=earn_cap(uid, random.randint(CHAT_MIN, CHAT_MAX)))
+    change(uid, cash=random.randint(CHAT_MIN, CHAT_MAX))
     touch(uid)
 
 
@@ -1196,8 +1170,6 @@ def roulette(uid, args):
     if err:
         return with_usage(err, ROUL_USAGE)
     ch, now = cur.channel, time.time()
-    if any(b[0] == uid for rg in roulette_games.values() for b in rg["bets"]):
-        return "❌ You already have a bet on the table, wait for the spin."
     change(uid, cash=-bet)  # held until the wheel stops
     g = roulette_games.get(ch)
     new = g is None
@@ -1227,21 +1199,18 @@ def roulette_spin(ch):
         n = random.randint(0, 36)
         color = "green" if n == 0 else ("red" if n in RED else "black")
         results = {}
-        capped = set()
         for uid, bet, raw, (label, mult, test) in g["bets"]:
             r = results.setdefault(uid, [0, 0])
             if test(n):
                 profit = win_profit(uid, bet, mult)
                 change(uid, cash=bet + profit)
                 r[0] += profit
-                if profit < int(bet * mult * wealth_factor(uid)):
-                    capped.add(uid)
             else:
                 r[1] += bet
         lines = []
         for uid, (won, lost) in results.items():
             net = won - lost
-            lines.append(f"{'✅' if net > 0 else ('➖' if net == 0 else '❌')} <@{uid}> *{signed(net)}*" + (" 🚫 daily limit" if uid in capped else ""))
+            lines.append(f"{'✅' if net > 0 else ('➖' if net == 0 else '❌')} <@{uid}> *{signed(net)}*")
             glog(uid, "played roulette", f"ball on {color} {n}: {signed(net)}")
         total = sum(b[1] for b in g["bets"])
     text = f"🎡 *The ball landed on {color} {n}!*\n" + "\n".join(lines)
@@ -1268,8 +1237,8 @@ def stake_text(bet):
 
 
 def pvp_win(winner, bet):
-    """Pays the winner both bets + the house bonus (the bonus counts toward the daily earning limit). Returns the gain."""
-    bonus = earn_cap(winner, bet * PVP_BONUS)
+    """Pays the winner both bets + the house bonus. Returns the gain."""
+    bonus = bet * PVP_BONUS
     change(winner, cash=bet * 2 + bonus)
     return bet + bonus
 
@@ -1690,8 +1659,8 @@ ADMIN_HELP = (
     "`cap @user <amount>` / `cap all <amount>`: cut total coins down to the amount (cash first)\n"
     "`set @user <cash> [bank]` · `take @user <amount|all>` · `giveall <amount>` (cash to everyone)\n"
     "`undo`: restore the last nuke/cap/set/take\n"
-    "`resetcd @user|all`: clear cooldowns · `limit [amount]`: daily earning limit (now/change)\n"
-    "`ban @user` / `unban @user`: block from the economy · `info @user`: balance + earned today\n"
+    "`resetcd @user|all`: clear cooldowns\n"
+    "`ban @user` / `unban @user`: block from the economy · `info @user`: balance\n"
     "`item-remove <name>`: delete an item (also `/delete-item`)\n"
     "Money changes can be checked with `/audit @user`.")
 
@@ -1802,13 +1771,6 @@ def admin_cmd(uid, args):
                 return "❌ Usage: `/admin resetcd @user` or `/admin resetcd all`"
             db.commit()
         return "✅ Cooldowns cleared."
-    if sub == "limit":
-        if rest:
-            amt = parse_amount(rest[0], 0)
-            if not amt:
-                return "❌ Usage: `/admin limit <amount>`"
-            set_setting("daily_cap", amt)
-        return f"✅ Daily earning limit is {fmt(setting('daily_cap', DAILY_CAP))} per person per 24h."
     if sub in ("ban", "unban"):
         if not tgt:
             return f"❌ Usage: `/admin {sub} @user`"
@@ -1818,10 +1780,7 @@ def admin_cmd(uid, args):
         if not tgt:
             return "❌ Usage: `/admin info @user`"
         c, b = get(tgt)
-        with lock:
-            e = db.execute("SELECT COALESCE(SUM(amt),0) FROM earned WHERE uid=? AND ts>?", (tgt, time.time() - 86400)).fetchone()[0]
-        return (f"ℹ️ {tag(tgt)}: cash {fmt(c)} · bank {fmt(b)} · earned in the last 24h {fmt(e)} "
-                f"of {fmt(setting('daily_cap', DAILY_CAP))}{' · 🔒 blocked' if setting(f'ban:{tgt}', 0) else ''}")
+        return f"ℹ️ {tag(tgt)}: cash {fmt(c)} · bank {fmt(b)}{' · 🔒 blocked' if setting(f'ban:{tgt}', 0) else ''}"
     if sub in ("item-remove", "remove-item", "delete-item"):
         return remove_item(rest[0]) if rest else "❌ Usage: `/admin item-remove <name>`"
     return ADMIN_HELP
@@ -1913,14 +1872,14 @@ def help_blocks(admin=False):
         "`/catalog [item]` – items for sale. `/buy <item> [amount]` · `/inventory` · `/use <item> [amount]`",
 
         f"*ℹ️ Good to know*\n"
-        f"Bets accept numbers, `5k`, `half` or `all`. There's no max bet, but there's a limit on how fast you can play games. "
+        f"Bets accept numbers, `5k`, `half` or `all`. There are no bet limits. "
         "Payouts shrink a little when you're very rich (over 100k) so nobody snowballs forever. "
         "Money and solo-game commands are only visible to you; rob, give, roulette and challenges are public.\n"
         "🏆 Top the `/lb` and you can win prizes too!",
     ]
     if admin:
         parts.append("*🛠 Admin (only you can see this)*\n"
-                     "`/admin help` lists the admin tools (nuke, cap, set, take, undo, limit, ban, item-remove…)\n"
+                     "`/admin help` lists the admin tools (nuke, cap, set, take, undo, ban, item-remove…)\n"
                      "`/add-money @user <amount>` · `/create-item <name> <price> <description>` · `/delete-item <name>` · `/audit @user`\n"
                      "`/set-blackjack-decks <1-8>` · "
                      "`/set-game-cooldown <usages> <duration>` (e.g. `4 5m`)")
