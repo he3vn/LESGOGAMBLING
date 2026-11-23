@@ -10,7 +10,7 @@ if "SLACK_BOT_TOKEN" not in os.environ or "SLACK_APP_TOKEN" not in os.environ:
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
-ADMINS = {"U0C7S6T72DD"}  # Slack member IDs allowed to use admin commands
+ADMINS = {"U0C7S6T72DD"}  # Slack member IDs allowed to use admin commands (also hidden from /lb)
 
 # ---------- database ----------
 SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco.db")  # a copy shipped in the code repo
@@ -309,7 +309,10 @@ def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="epheme
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
     if buttons:
         blocks.append({"type": "actions", "elements": buttons})
-    d = {"text": text.replace("*", "")[:300], "attachments": [{"color": color, "blocks": blocks}]}
+    plain = text.replace("*", "")[:300]
+    # "text" is only a notification fallback. The senders below blank it so the message is shown once
+    # (only the coloured box). The attachment has its own fallback for notifications.
+    d = {"text": plain, "attachments": [{"color": color, "fallback": plain, "blocks": blocks}]}
     if rt:
         d["response_type"] = rt
     if nolog:
@@ -320,7 +323,7 @@ def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="epheme
 def swap(respond, view):
     """Replace the message a button was clicked on."""
     v = render(view, False)
-    respond(replace_original=True, text=v["text"], attachments=v["attachments"])
+    respond(replace_original=True, text="", attachments=v["attachments"])
 
 
 def only_you(respond, text):
@@ -499,7 +502,10 @@ def cmd(name, keep_case=False):
             nolog = False
             if isinstance(out, dict):
                 nolog = out.pop("nolog", False)
-                respond(**render(out, False))
+                send = render(out, False)
+                if "attachments" in send:
+                    send["text"] = ""  # only the coloured box shows, no duplicate text above it
+                respond(**send)
                 text = out.get("text", "")
             else:
                 private = cname not in PUBLIC or out.startswith(("❌", "⏱", "🔒"))
@@ -608,16 +614,21 @@ def give(uid, args):
 
 @cmd("leaderboard")
 def leaderboard(uid, args):
+    adm = list(ADMINS)
+    marks = ",".join("?" * len(adm))
     with lock:
-        rows = db.execute("SELECT uid, cash+bank AS t FROM users ORDER BY t DESC LIMIT 10").fetchall()
+        rows = db.execute(f"SELECT uid, cash+bank AS t FROM users WHERE uid NOT IN ({marks}) "
+                          f"ORDER BY t DESC LIMIT 10", adm).fetchall()
         mine = sum(get(uid))
-        rank = db.execute("SELECT COUNT(*) FROM users WHERE cash+bank > ?", (mine,)).fetchone()[0] + 1
+        rank = db.execute(f"SELECT COUNT(*) FROM users WHERE uid NOT IN ({marks}) AND cash+bank > ?",
+                          adm + [mine]).fetchone()[0] + 1
     if not rows:
         return "❌ Nobody has played yet!"
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = "\n".join(f"{medals.get(i, f'`{i}.`')} {tag(u)} • {fmt(t)}" for i, (u, t) in enumerate(rows, 1))
-    return embed(f"🏆 *Leaderboard*\n{lines}", C_GOLD, nolog=True,
-                 footer=f"Your leaderboard rank: {ordinal(rank)} · {fmt(mine)}")
+    footer = (f"You're an admin, so you're hidden from the leaderboard · {fmt(mine)}" if uid in ADMINS
+              else f"Your leaderboard rank: {ordinal(rank)} · {fmt(mine)}")
+    return embed(f"🏆 *Leaderboard*\n{lines}", C_GOLD, nolog=True, footer=footer)
 
 
 @cmd("stats")
@@ -1170,7 +1181,8 @@ def roulette_spin(ch):
             glog(uid, "played roulette", f"ball on {color} {n}: {signed(net)}")
         total = sum(b[1] for b in g["bets"])
     text = f"🎡 *The ball landed on {color} {n}!*\n" + "\n".join(lines)
-    body = {"text": text.replace("*", ""), "attachments": [{"color": {"red": C_RED, "black": C_GREY, "green": C_GREEN}[color],
+    body = {"text": "", "attachments": [{"fallback": text.replace("*", "")[:300],
+            "color": {"red": C_RED, "black": C_GREY, "green": C_GREEN}[color],
             "blocks": [section(text), {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{len(results)} player(s) · {fmt(total)} bet in total"}]}]}]}
     try:
         app.client.chat_postMessage(channel=ch, **body)
