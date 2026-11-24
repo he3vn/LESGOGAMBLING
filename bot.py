@@ -314,7 +314,8 @@ def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="epheme
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
     if buttons:
         blocks.append({"type": "actions", "elements": buttons})
-    d = {"text": text.replace("*", "")[:300], "attachments": [{"color": color, "blocks": blocks}]}
+    plain = text.replace("*", "")[:300]
+    d = {"text": plain, "attachments": [{"color": color, "fallback": plain, "blocks": blocks}]}
     if rt:
         d["response_type"] = rt
     if nolog:
@@ -323,16 +324,18 @@ def embed(text, color=C_BLUE, fields=None, buttons=None, footer=None, rt="epheme
 
 
 def wire(d):
-    """Slack shows `text` AND the attachment when both are sent (double message). Send only the attachment."""
-    d = dict(d)
-    if d.get("attachments"):
-        d.pop("text", None)
-    return d
+    """What we actually send to Slack. Only keys Slack understands (our own `nolog` key made the
+    button handlers crash), and an empty `text` when there is an attachment so it isn't shown twice."""
+    out = {k: d[k] for k in ("text", "attachments", "blocks", "response_type") if k in d}
+    if out.get("attachments"):
+        out["text"] = ""
+    return out
 
 
 def swap(respond, view):
     """Replace the message a button was clicked on."""
     v = wire(render(view, False))
+    v.pop("response_type", None)
     respond(replace_original=True, **v)
 
 
