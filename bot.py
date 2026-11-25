@@ -148,11 +148,11 @@ def backup_loop():
 restore_db()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 lock = threading.RLock()
-db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash INTEGER DEFAULT 100, bank INTEGER DEFAULT 0)")
+db.execute("CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, cash TEXT DEFAULT '100', bank TEXT DEFAULT '0')")
 db.execute("CREATE TABLE IF NOT EXISTS cooldowns (uid TEXT, action TEXT, ts REAL, PRIMARY KEY (uid, action))")
 db.execute("CREATE TABLE IF NOT EXISTS items (name TEXT PRIMARY KEY, price INTEGER, description TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS inv (uid TEXT, name TEXT, amount INTEGER, PRIMARY KEY (uid, name))")
-db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash INTEGER, bank INTEGER, why TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS log (ts REAL, uid TEXT, cash TEXT, bank TEXT, why TEXT)")
 try:
     db.execute("ALTER TABLE users ADD COLUMN name TEXT")
 except sqlite3.OperationalError:
@@ -175,17 +175,20 @@ def fmt(n):
 
 def get(uid):
     with lock:
-        db.execute("INSERT OR IGNORE INTO users (uid) VALUES (?)", (uid,))
+        db.execute("INSERT OR IGNORE INTO users (uid, cash, bank) VALUES (?, '100', '0')", (uid,))
         db.commit()
-        return db.execute("SELECT cash, bank FROM users WHERE uid=?", (uid,)).fetchone()
+        cash, bank = db.execute("SELECT cash, bank FROM users WHERE uid=?", (uid,)).fetchone()
+        return int(cash), int(bank)
 
 
 def change(uid, cash=0, bank=0):
-    get(uid)
+    cur_cash, cur_bank = get(uid)
+    new_cash = str(cur_cash + int(cash))
+    new_bank = str(cur_bank + int(bank))
     why = sys._getframe(1).f_code.co_name  # which function moved the money (see /audit)
     with lock:
-        db.execute("UPDATE users SET cash=cash+?, bank=bank+? WHERE uid=?", (int(cash), int(bank), uid))
-        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, int(cash), int(bank), why))
+        db.execute("UPDATE users SET cash=?, bank=? WHERE uid=?", (new_cash, new_bank, uid))
+        db.execute("INSERT INTO log VALUES (?,?,?,?,?)", (time.time(), uid, str(int(cash)), str(int(bank)), why))
         if random.random() < 0.01:
             db.execute("DELETE FROM log WHERE ts < ?", (time.time() - 7 * 86400,))
         db.commit()
@@ -379,18 +382,20 @@ def give(uid, args):
 @cmd("leaderboard")
 def leaderboard(uid, args):
     with lock:
-        rows = db.execute("SELECT uid, cash+bank AS t FROM users ORDER BY t DESC LIMIT 10").fetchall()
+        rows = db.execute("SELECT uid, cash, bank FROM users").fetchall()
     if not rows:
         return "❌ Nobody has played yet!"
-    return "*🏆 Leaderboard*\n" + "\n".join(f"{i}. {tag(u)} • {fmt(t)}" for i, (u, t) in enumerate(rows, 1))
+    ranked = sorted(((u, int(c) + int(b)) for u, c, b in rows), key=lambda x: x[1], reverse=True)[:10]
+    return "*🏆 Leaderboard*\n" + "\n".join(f"{i}. {tag(u)} • {fmt(t)}" for i, (u, t) in enumerate(ranked, 1))
 
 
 @cmd("stats")
 def stats(uid, args):
     with lock:
-        cash, bank, n = db.execute(
-            "SELECT COALESCE(SUM(cash),0), COALESCE(SUM(bank),0), COUNT(*) FROM users").fetchone()
-    return (f"*📊 Economy stats*\nPlayers: {n:,}\nTotal cash: {fmt(cash)}\n"
+        rows = db.execute("SELECT cash, bank FROM users").fetchall()
+    cash = sum(int(c) for c, _ in rows)
+    bank = sum(int(b) for _, b in rows)
+    return (f"*📊 Economy stats*\nPlayers: {len(rows):,}\nTotal cash: {fmt(cash)}\n"
             f"Total bank: {fmt(bank)}\nTotal: {fmt(cash + bank)}")
 
 
@@ -1064,7 +1069,7 @@ def audit(uid, args):
                           (target,)).fetchall()
     if not rows:
         return "No logged money moves for that user yet."
-    lines = [f"`{time.strftime('%d %H:%M:%S', time.gmtime(t))}` cash {c:+,} bank {b:+,} ({w})"
+    lines = [f"`{time.strftime('%d %H:%M:%S', time.gmtime(t))}` cash {int(c):+,} bank {int(b):+,} ({w})"
              for t, c, b, w in rows]
     return f"*Last moves (UTC)* for {tag(target)}\n" + "\n".join(lines)
 
